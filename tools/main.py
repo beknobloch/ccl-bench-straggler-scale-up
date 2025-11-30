@@ -17,6 +17,9 @@ if __name__ == "__main__":
     if metric_name == "coll_call_num":
         from coll_call_num.coll_call_num import metric_cal
         metric_cal_func = metric_cal
+    elif metric_name == "straggler_delay":
+        from straggler.straggler_delay import metric_cal
+        metric_cal_func = metric_cal
     else:
         raise ValueError(f"Unsupported metric name: {metric_name}")
     
