@@ -1,307 +1,290 @@
-#!/usr/bin/env python3
-"""
-Trace generator using TorchTitan + torch.profiler.
-
-- Reads a workload card under trace_collection/.
-- Supports training (forward+backward) and inference (forward only).
-- Collects PyTorch Execution Trace (`*_rank<N>_et.json`) and Kineto trace
-  (`*_rank<N>_trace.json`) next to the workload card.
-- Designed to run under torchrun for multi-GPU; TorchTitan is optional but
-  parallel settings from the card are parsed and honored when possible.
-"""
-
-from __future__ import annotations
-
-import argparse
-import inspect
-import os
-from pathlib import Path
-from typing import Any, Dict, Tuple
-
 import torch
-import torch.distributed as dist
 import yaml
-from torch import nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.profiler import ExecutionTraceObserver, ProfilerActivity, profile, schedule
+import os
+import argparse
+import json
+from torch.profiler import profile, record_function, ProfilerActivity
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.distributed as dist
+from torchtitan.distributed import ParallelDims
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
+from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
+from torch.distributed.tensor.parallel.style import PrepareModuleInput
 
-try:
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-except Exception:  # pragma: no cover - FSDP might be missing on CPU-only envs
-    FSDP = None
+# -----------------------------
+# Setup distributed environment
+# -----------------------------
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    else:
+        # Single GPU fallback
+        return 0, 1, 0
 
-PRECISION_TO_DTYPE = {
-    "bf16": torch.bfloat16,
-    "bfloat16": torch.bfloat16,
-    "fp16": torch.float16,
-    "float16": torch.float16,
-    "fp32": torch.float32,
-    "float32": torch.float32,
-}
+# -----------------------------
+# Load workload card parameters
+# -----------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--workload_card", type=str, required=True)
+parser.add_argument("--forward-only", action="store_true", help="Skip backward pass (forward inference only)")
+parser.add_argument("--batch-size", type=int, default=None, help="Override batch size from workload card")
+parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length from workload card")
+args = parser.parse_args()
 
-MODEL_HIDDEN_SIZE = {
-    "llama-3.1-8b": 4096,
-    "llama-3.1-70b": 8192,
-    "llama-3-8b": 4096,
-    "deepseek_v2": 4096,
-}
+with open(args.workload_card, "r") as f:
+    card = yaml.safe_load(f)
 
+# Extract model path from HF URL
+hf_url = card["hf_url"]
+model_name = '/'.join(hf_url.split('/')[-2:])
 
-class TinyTransformerLM(nn.Module):
-    """Lightweight transformer-ish block to exercise kernels without heavy deps."""
+batch_size = args.batch_size if args.batch_size else card["workload"]["data"]["batch_size"]
+seq_len = args.seq_len if args.seq_len else card["workload"]["data"]["seq_len"]
 
-    def __init__(self, hidden_size: int, vocab_size: int = 32000) -> None:
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.LayerNorm(hidden_size),
+dp_replicate = card["Model-executor"]["model_plan_parallelization"].get("dp_replicate", 1)
+dp_shard = card["Model-executor"]["model_plan_parallelization"].get("dp_shard", 1)
+tp = card["Model-executor"]["model_plan_parallelization"]["tp"]
+pp = card["Model-executor"]["model_plan_parallelization"]["pp"]
+cp = card["Model-executor"]["model_plan_parallelization"].get("cp", 1)
+
+# Initialize distributed
+rank, world_size, local_rank = setup_distributed()
+device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+if rank == 0:
+    print(f"World size: {world_size}, Device: {device}")
+    print(f"Model: {model_name}, Batch size: {batch_size}, Seq length: {seq_len}")
+    print(f"DP replicate: {dp_replicate}, DP shard: {dp_shard}, TP: {tp}, PP: {pp}, CP: {cp}")
+
+# -----------------------------
+# Build TorchTitan parallel dims
+# -----------------------------
+parallel_dims = ParallelDims(
+    dp_replicate=dp_replicate,
+    dp_shard=dp_shard,
+    tp=tp,
+    pp=pp,
+    cp=cp,
+    ep=1,
+    etp=1,
+    world_size=world_size,
+)
+
+# -----------------------------
+# Load model with HuggingFace
+# -----------------------------
+if rank == 0:
+    print("Loading model...")
+
+# Load on CPU to avoid OOM during initialization
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    device_map=None,
+)
+
+# Load tokenizer that matches the model
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+# Ensure we have a pad token for batching
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Enable gradient checkpointing BEFORE FSDP wrapping
+if hasattr(model, 'gradient_checkpointing_enable'):
+    model.gradient_checkpointing_enable()
+    if rank == 0:
+        print("Gradient checkpointing enabled")
+
+# Apply parallelism using TorchTitan's ParallelDims
+if world_size > 1:
+    world_mesh = parallel_dims.build_mesh()
+    if rank == 0:
+        print(f"Built device mesh: {world_mesh}")
+    
+    # Tensor Parallelism: shard model layers across GPUs
+    if parallel_dims.tp_enabled:
+        if rank == 0:
+            print("Applying Tensor Parallelism...")
+        tp_mesh = world_mesh["tp"]
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        }
+        model = parallelize_module(model, tp_mesh, plan)
+    
+    if parallel_dims.dp_shard_enabled:
+        # FSDP: shard parameters and gradients
+        if rank == 0:
+            print("Applying FSDP with per-layer wrapping...")
+        
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        from functools import partial
+        
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={LlamaDecoderLayer},
         )
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed(input_ids)
-        x = self.ffn(x)
-        return self.lm_head(x)
-
-
-def load_card(path: Path) -> Dict[str, Any]:
-    with path.open("r") as handle:
-        return yaml.safe_load(handle)
-
-
-def normalize_precision(raw: str | None) -> torch.dtype:
-    if raw is None:
-        return torch.float32
-    return PRECISION_TO_DTYPE.get(raw.lower(), torch.float32)
-
-
-def infer_hidden_size(card: Dict[str, Any]) -> int:
-    model_family = (
-        card.get("workload", {})
-        .get("model", {})
-        .get("model_family", "")
-        .lower()
-        .replace(" ", "")
-    )
-    return MODEL_HIDDEN_SIZE.get(model_family, 4096)
-
-
-def setup_distributed() -> Tuple[int, int, int, torch.device]:
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend=backend)
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
-    return rank, local_rank, world_size, device
-
-
-def parse_parallel_cfg(card: Dict[str, Any]) -> Dict[str, int]:
-    defaults = {"dp_replicate": 1, "dp_shard": 1, "tp": 1, "pp": 1, "cp": 1}
-    user_cfg = card.get("Model-executor", {}).get("model_plan_parallelization", {}) or {}
-    for key in defaults:
-        defaults[key] = int(user_cfg.get(key, defaults[key]) or 1)
-    return defaults
-
-
-def maybe_init_torchtitan(parallel_cfg: Dict[str, int]) -> None:
-    """Attempt to initialize TorchTitan parallel groups if available."""
-    try:
-        import torchtitan  # type: ignore
-    except ImportError:
-        print("[torchtitan] Not installed; continuing with torch.distributed only.")
-        return
-
-    params = {
-        "tensor_parallel_size": parallel_cfg["tp"],
-        "pipeline_parallel_size": parallel_cfg["pp"],
-        "context_parallel_size": parallel_cfg["cp"],
-        "data_parallel_size": parallel_cfg["dp_replicate"] * parallel_cfg["dp_shard"],
-        "tp_size": parallel_cfg["tp"],
-        "pp_size": parallel_cfg["pp"],
-        "cp_size": parallel_cfg["cp"],
-        "dp_size": parallel_cfg["dp_replicate"] * parallel_cfg["dp_shard"],
-    }
-
-    candidates = []
-    parallel_mod = getattr(torchtitan, "parallel", None)
-    for name in ("initialize_model_parallel", "init_model_parallel", "initialize_parallel_groups"):
-        if parallel_mod is not None and hasattr(parallel_mod, name):
-            candidates.append((f"torchtitan.parallel.{name}", getattr(parallel_mod, name)))
-        if hasattr(torchtitan, name):
-            candidates.append((f"torchtitan.{name}", getattr(torchtitan, name)))
-
-    for label, fn in candidates:
-        if fn is None:
-            continue
-        try:
-            sig = inspect.signature(fn)
-            kwargs = {arg: params[arg] for arg in sig.parameters if arg in params}
-            fn(**kwargs)
-            print(f"[torchtitan] Initialized via {label} with {kwargs}")
-            return
-        except Exception as exc:  # pragma: no cover - runtime environment specific
-            print(f"[torchtitan] {label} failed ({exc}); will keep going.")
-
-    print("[torchtitan] Present but no init function matched; skipping Titan init.")
-
-
-def wrap_model_for_parallelism(
-    model: nn.Module,
-    device: torch.device,
-    world_size: int,
-    parallel_cfg: Dict[str, int],
-) -> nn.Module:
+        
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True,
+            limit_all_gathers=True,
+            forward_prefetch=True,
+        )
+    else:
+        model = model.to(device)
+else:
     model = model.to(device)
-    if world_size <= 1:
-        return model
 
-    if parallel_cfg["dp_shard"] > 1 and FSDP is not None:
-        return FSDP(model)
-    if parallel_cfg["dp_shard"] > 1 and FSDP is None:
-        print("[warning] dp_shard>1 requested but torch.distributed.fsdp is unavailable; falling back to DDP.")
+# -----------------------------
+# Load C4 dataset shard instead of dummy data
+# -----------------------------
+def load_c4_texts(path, max_docs=None):
+    texts = []
+    with open(path, "r") as f:
+        # Try to detect if file is JSON lines or a JSON array
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == "[":
+            data = json.load(f)
+            for d in data:
+                t = d.get("text") or d.get("content") or d.get("raw")
+                if t:
+                    texts.append(t)
+                    if max_docs and len(texts) >= max_docs:
+                        break
+        else:
+            # JSON Lines
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                t = obj.get("text") or obj.get("content") or obj.get("raw")
+                if t:
+                    texts.append(t)
+                    if max_docs and len(texts) >= max_docs:
+                        break
+    return texts
 
-    device_id = device.index if device.type == "cuda" else None
-    return DDP(model, device_ids=[device_id] if device_id is not None else None)
+if rank == 0:
+    print("Loading C4 shard...")
 
+c4_path = "c4_dataset/en/c4-train.00000-of-01024.json"
 
-def generate_tokens(batch_size: int, seq_len: int, vocab_size: int, device: torch.device) -> torch.Tensor:
-    return torch.randint(low=0, high=vocab_size - 1, size=(batch_size, seq_len), device=device)
+# Load enough docs for all ranks
+max_docs = batch_size * world_size
+all_texts = load_c4_texts(c4_path, max_docs=max_docs)
 
+if len(all_texts) == 0:
+    raise RuntimeError(f"No usable texts found in {c4_path}")
 
-def run_training_step(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    input_ids: torch.Tensor,
-    dtype: torch.dtype,
-    device_type: str,
-) -> float:
-    model.train()
-    with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-        logits = model(input_ids)
-        loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), input_ids.view(-1))
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    return float(loss.detach())
+# Give each rank its own slice of texts
+rank_texts = all_texts[rank::world_size]
+if len(rank_texts) < batch_size:
+    # Repeat texts if there are not enough for this rank
+    repeat_factor = (batch_size + len(rank_texts) - 1) // len(rank_texts)
+    rank_texts = (rank_texts * repeat_factor)[:batch_size]
+else:
+    rank_texts = rank_texts[:batch_size]
 
+if rank == 0:
+    print("Example input text:", rank_texts[0][:200])
 
-def run_inference_step(
-    model: nn.Module,
-    input_ids: torch.Tensor,
-    dtype: torch.dtype,
-    device_type: str,
-) -> float:
-    model.eval()
-    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-        logits = model(input_ids)
-        loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), input_ids.view(-1))
-    return float(loss.detach())
+enc = tokenizer(
+    rank_texts,
+    padding="max_length",
+    truncation=True,
+    max_length=seq_len,
+    return_tensors="pt",
+)
 
+inputs = enc["input_ids"].to(device)
+attention_mask = enc["attention_mask"].to(device)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect Kineto + ET traces using TorchTitan + torch.profiler.")
-    parser.add_argument("--workload-card", required=True, type=Path, help="Path to workload YAML under trace_collection/")
-    parser.add_argument("--task", choices=["training", "inference"], help="Override workload.model.phase")
-    parser.add_argument("--warmup", type=int, default=1, help="Profiler warmup iterations")
-    parser.add_argument("--iteration", type=int, help="Measured iterations (defaults to workload.model.iteration or 10)")
-    args = parser.parse_args()
+# -----------------------------
+# Run trace (1 iteration)
+# -----------------------------
+if rank == 0:
+    print("Running trace...")
 
-    card = load_card(args.workload_card)
-    workload = card.get("workload", {})
-    model_cfg = workload.get("model", {})
-    data_cfg = workload.get("data", {})
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    with_stack=True,
+    profile_memory=True,
+    with_modules=True,
+) as prof:
 
-    phase = (args.task or model_cfg.get("phase", "training")).lower()
-    if phase not in {"training", "inference"}:
-        raise ValueError("phase must be training or inference")
+    if args.forward_only:
+        # Forward-only (inference) mode
+        with record_function("forward_only"):
+            with torch.no_grad():
+                output = model(inputs, attention_mask=attention_mask)
+            
+            if world_size > 1:
+                dist.barrier()
+    else:
+        # Forward + Backward (training) mode
+        with record_function("forward_backward"):
+            output = model(inputs, attention_mask=attention_mask)
+            logits = output.logits
+            loss = logits.sum()
+            loss.backward()
+            
+            if world_size > 1:
+                dist.barrier()
 
-    batch_size = int(data_cfg.get("batch_size", 1))
-    seq_len = int(data_cfg.get("seq_len", 1024))
-    hidden_size = infer_hidden_size(card)
-    precision = normalize_precision(model_cfg.get("precision"))
-    iterations = args.iteration or int(model_cfg.get("iteration", 10))
-    iterations = max(iterations, args.warmup + 1)
-    vocab_size = 32000
+# -----------------------------
+# Save trace
+# -----------------------------
+trace_file = f"trace_rank_{rank}.json"
+prof.export_chrome_trace(trace_file)
+print(f"Rank {rank}: Trace saved to {trace_file}")
 
-    rank, _, world_size, device = setup_distributed()
-    parallel_cfg = parse_parallel_cfg(card)
-    expected_world = (
-        parallel_cfg["dp_replicate"]
-        * parallel_cfg["dp_shard"]
-        * parallel_cfg["tp"]
-        * parallel_cfg["pp"]
-        * parallel_cfg["cp"]
-    )
-    if expected_world and expected_world != 1 and expected_world != world_size:
-        print(
-            f"[warning] Product of parallel dims ({expected_world}) != world_size ({world_size}); "
-            "continuing but check your launch command."
-        )
-    if any(parallel_cfg.get(dim, 1) > 1 for dim in ("tp", "pp", "cp")):
-        print("[note] tp/pp/cp parsed from the card; this script keeps a single-module toy model.")
+# Cleanup
+if world_size > 1:
+    dist.destroy_process_group()
 
-    maybe_init_torchtitan(parallel_cfg)
+# salloc --nodes 1 --qos interactive --time 01:00:00 --constraint gpu --gpus 4 --account m4999
+# hf auth login
+# export HF_HOME=/pscratch/sd/m/mh2653/.cache/huggingface
 
-    output_dir = args.workload_card.parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+# torchrun --nproc_per_node=4 trace_gen/trace_gen.py -- --workload_card trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-2GPU-pure-DP-perlmutter-inference.yaml
 
-    model = TinyTransformerLM(hidden_size=hidden_size, vocab_size=vocab_size)
-    model = wrap_model_for_parallelism(model, device, world_size, parallel_cfg)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+# python tools/main.py --trace ./ --metric coll_call_num
+# python tools/main.py --trace ./ --metric straggler_delay
+# python tools/main.py --trace ./ --metric straggler_slowdown
 
-    prefix = f"{args.workload_card.stem}_{phase}_rank{rank}"
-    et_file = output_dir / f"{prefix}_et.json"
-    kineto_file = output_dir / f"{prefix}_trace.json"
+# FSDP (2GPUs)
+# coll_call_num: rank0: 99, rank1: 99
+# straggler_delay: 3.095612673844695e-07
+# straggler_slowdown: 1.0000390489546451
 
-    et = ExecutionTraceObserver()
-    et.register_callback(str(et_file))
-    et.start()
+# FSDP (4GPUs)
+# coll_call_num: rank0: 99, rank1: 99, rank2: 99, rank3: 99
+# straggler_delay: 5.303492827743813e-07
+# straggler_slowdown: 1.0007944156004465
 
-    losses: list[float] = []
-    try:
-        use_cuda = device.type == "cuda"
-        prof_activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if use_cuda else [])
-        prof_schedule = schedule(wait=0, warmup=args.warmup, active=1)
+# TP (2GPUs)
+# coll_call_num: rank0: 129, rank1: 129
+# straggler_delay: 1.129688648118878e-06
+# straggler_slowdown: 1.0000241782508983
 
-        device_type = "cuda" if use_cuda else "cpu"
-        with profile(activities=prof_activities, schedule=prof_schedule, record_shapes=True) as prof:
-            for step in range(iterations):
-                input_ids = generate_tokens(batch_size, seq_len, vocab_size, device)
-                if phase == "training":
-                    loss_val = run_training_step(model, optimizer, input_ids, precision, device_type)
-                else:
-                    loss_val = run_inference_step(model, input_ids, precision, device_type)
-                losses.append(loss_val)
-                if world_size > 1 and dist.is_initialized():
-                    dist.barrier()
-                prof.step()
-            prof.export_chrome_trace(str(kineto_file))
-    finally:
-        et.stop()
-        et.unregister_callback()
-
-    if world_size > 1 and dist.is_initialized():
-        dist.barrier()
-
-    mean_loss = sum(losses) / max(1, len(losses))
-    print(f"[Rank {rank}/{world_size}] phase={phase} mean_loss={mean_loss:.4f}")
-    print(f"[Rank {rank}/{world_size}] ET trace: {et_file}")
-    print(f"[Rank {rank}/{world_size}] Kineto trace: {kineto_file}")
-
-
-if __name__ == "__main__":
-    main()
-
-# Example command (inference, single GPU):
-#   python trace_gen/trace_gen.py --workload-card trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-2GPU-pure-DP-perlmutter-inference.yaml
-#
-# Multi-GPU with torchrun (each rank writes its own trace):
-#   torchrun --nproc_per_node=4 trace_gen/trace_gen.py --workload-card trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-2GPU-pure-DP-perlmutter-inference.yaml
+# TP (4GPUs)
+# coll_call_num: rank0: 129, rank1: 129, rank2: 129, rank3: 129
+# straggler_delay: 4.903407062305596e-07
+# straggler_slowdown: 1.0002771298074606
