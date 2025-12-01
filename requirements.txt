@@ -1,3 +1,8 @@
-matplotlib
+torch
+transformers
+pyyaml
+parambench-train-compute
 numpy
 pandas
+matplotlib
+huggingface_hub
