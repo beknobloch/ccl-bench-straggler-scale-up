@@ -6,6 +6,7 @@ import json
 from torch.profiler import profile, record_function, ProfilerActivity
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch.distributed as dist
+from tqdm import tqdm
 from torchtitan.distributed import ParallelDims
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
 from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
@@ -37,6 +38,7 @@ parser.add_argument("--workload_card", type=str, required=True)
 parser.add_argument("--forward-only", action="store_true", help="Skip backward pass (forward inference only)")
 parser.add_argument("--batch-size", type=int, default=None, help="Override batch size from workload card")
 parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length from workload card")
+parser.add_argument("--max-docs", type=int, default=None, help="Optional limit on number of docs to load from dataset")
 args = parser.parse_args()
 
 with open(args.workload_card, "r") as f:
@@ -185,41 +187,29 @@ if rank == 0:
 
 c4_path = "c4_dataset/en/c4-train.00000-of-01024.json"
 
-# Load enough docs for all ranks
-max_docs = batch_size * world_size
-all_texts = load_c4_texts(c4_path, max_docs=max_docs)
+# Load docs (optionally limited via CLI)
+all_texts = load_c4_texts(c4_path, max_docs=args.max_docs)
 
 if len(all_texts) == 0:
     raise RuntimeError(f"No usable texts found in {c4_path}")
 
 # Give each rank its own slice of texts
 rank_texts = all_texts[rank::world_size]
-if len(rank_texts) < batch_size:
-    # Repeat texts if there are not enough for this rank
-    repeat_factor = (batch_size + len(rank_texts) - 1) // len(rank_texts)
-    rank_texts = (rank_texts * repeat_factor)[:batch_size]
-else:
-    rank_texts = rank_texts[:batch_size]
+if len(rank_texts) == 0:
+    raise RuntimeError(f"Rank {rank} has no assigned texts from dataset slice")
 
 if rank == 0:
+    print(f"Total docs loaded: {len(all_texts)}, docs per rank: {len(rank_texts)}")
     print("Example input text:", rank_texts[0][:200])
-
-enc = tokenizer(
-    rank_texts,
-    padding="max_length",
-    truncation=True,
-    max_length=seq_len,
-    return_tensors="pt",
-)
-
-inputs = enc["input_ids"].to(device)
-attention_mask = enc["attention_mask"].to(device)
+num_batches = (len(rank_texts) + batch_size - 1) // batch_size
 
 # -----------------------------
-# Run trace (1 iteration)
+# Run trace (iterate over dataset)
 # -----------------------------
 if rank == 0:
     print("Running trace...")
+
+progress_iter = tqdm(range(num_batches), desc="Batches", disable=rank != 0)
 
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -229,24 +219,40 @@ with profile(
     with_modules=True,
 ) as prof:
 
-    if args.forward_only:
-        # Forward-only (inference) mode
-        with record_function("forward_only"):
-            with torch.no_grad():
+    for batch_idx in progress_iter:
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(rank_texts))
+        batch_texts = rank_texts[start:end]
+
+        enc = tokenizer(
+            batch_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=seq_len,
+            return_tensors="pt",
+        )
+
+        inputs = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+
+        if args.forward_only:
+            # Forward-only (inference) mode
+            with record_function(f"forward_only_batch_{batch_idx}"):
+                with torch.no_grad():
+                    output = model(inputs, attention_mask=attention_mask)
+                
+                if world_size > 1:
+                    dist.barrier()
+        else:
+            # Forward + Backward (training) mode
+            with record_function(f"forward_backward_batch_{batch_idx}"):
                 output = model(inputs, attention_mask=attention_mask)
-            
-            if world_size > 1:
-                dist.barrier()
-    else:
-        # Forward + Backward (training) mode
-        with record_function("forward_backward"):
-            output = model(inputs, attention_mask=attention_mask)
-            logits = output.logits
-            loss = logits.sum()
-            loss.backward()
-            
-            if world_size > 1:
-                dist.barrier()
+                logits = output.logits
+                loss = logits.sum()
+                loss.backward()
+                
+                if world_size > 1:
+                    dist.barrier()
 
 # -----------------------------
 # Save trace
@@ -260,10 +266,10 @@ if world_size > 1:
     dist.destroy_process_group()
 
 # salloc --nodes 1 --qos interactive --time 01:00:00 --constraint gpu --gpus 4 --account m4999
-# hf auth login
 # export HF_HOME=/pscratch/sd/m/mh2653/.cache/huggingface
+# hf auth login
 
-# torchrun --nproc_per_node=4 trace_gen/trace_gen.py -- --workload_card trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-2GPU-pure-DP-perlmutter-inference.yaml
+# torchrun --nproc_per_node=4 trace_gen/trace_gen.py -- --workload_card trace_collection/llama-3.1-8b-perlmutter/llama-3.1-8b-4GPU-DP-perlmutter.yaml --max-docs 100
 
 # python tools/main.py --trace ./ --metric coll_call_num
 # python tools/main.py --trace ./ --metric straggler_delay
