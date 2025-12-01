@@ -6,3 +6,4 @@ pandas
 matplotlib
 huggingface_hub
 torchtitan
+tqdm
