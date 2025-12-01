@@ -2,8 +2,9 @@ import torch
 import yaml
 import os
 import argparse
+import json
 from torch.profiler import profile, record_function, ProfilerActivity
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch.distributed as dist
 from torchtitan.distributed import ParallelDims
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
@@ -90,6 +91,12 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map=None,
 )
 
+# Load tokenizer that matches the model
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+# Ensure we have a pad token for batching
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 # Enable gradient checkpointing BEFORE FSDP wrapping
 if hasattr(model, 'gradient_checkpointing_enable'):
     model.gradient_checkpointing_enable()
@@ -102,13 +109,11 @@ if world_size > 1:
     if rank == 0:
         print(f"Built device mesh: {world_mesh}")
     
-    # Apply different parallelism strategies based on config
+    # Tensor Parallelism: shard model layers across GPUs
     if parallel_dims.tp_enabled:
-        # Tensor Parallelism: shard model layers across GPUs
         if rank == 0:
             print("Applying Tensor Parallelism...")
         tp_mesh = world_mesh["tp"]
-        # Apply TP to attention layers (example for LLaMA)
         plan = {
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
@@ -122,11 +127,9 @@ if world_size > 1:
         if rank == 0:
             print("Applying FSDP with per-layer wrapping...")
         
-        # Import the transformer layer class for wrapping
         from transformers.models.llama.modeling_llama import LlamaDecoderLayer
         from functools import partial
         
-        # Create auto-wrap policy to wrap each transformer layer
         auto_wrap_policy = partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={LlamaDecoderLayer},
@@ -138,8 +141,8 @@ if world_size > 1:
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             use_orig_params=True,
-            limit_all_gathers=True,  # Reduce memory for all-gather
-            forward_prefetch=True,   # Prefetch next layer
+            limit_all_gathers=True,
+            forward_prefetch=True,
         )
     else:
         model = model.to(device)
@@ -147,14 +150,70 @@ else:
     model = model.to(device)
 
 # -----------------------------
-# Generate dummy data
+# Load C4 dataset shard instead of dummy data
 # -----------------------------
-inputs = torch.randint(
-    low=1,
-    high=32000,
-    size=(batch_size, seq_len),
-    device=device
+def load_c4_texts(path, max_docs=None):
+    texts = []
+    with open(path, "r") as f:
+        # Try to detect if file is JSON lines or a JSON array
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == "[":
+            data = json.load(f)
+            for d in data:
+                t = d.get("text") or d.get("content") or d.get("raw")
+                if t:
+                    texts.append(t)
+                    if max_docs and len(texts) >= max_docs:
+                        break
+        else:
+            # JSON Lines
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                t = obj.get("text") or obj.get("content") or obj.get("raw")
+                if t:
+                    texts.append(t)
+                    if max_docs and len(texts) >= max_docs:
+                        break
+    return texts
+
+if rank == 0:
+    print("Loading C4 shard...")
+
+c4_path = "c4_dataset/en/c4-train.00000-of-01024.json"
+
+# Load enough docs for all ranks
+max_docs = batch_size * world_size
+all_texts = load_c4_texts(c4_path, max_docs=max_docs)
+
+if len(all_texts) == 0:
+    raise RuntimeError(f"No usable texts found in {c4_path}")
+
+# Give each rank its own slice of texts
+rank_texts = all_texts[rank::world_size]
+if len(rank_texts) < batch_size:
+    # Repeat texts if there are not enough for this rank
+    repeat_factor = (batch_size + len(rank_texts) - 1) // len(rank_texts)
+    rank_texts = (rank_texts * repeat_factor)[:batch_size]
+else:
+    rank_texts = rank_texts[:batch_size]
+
+if rank == 0:
+    print("Example input text:", rank_texts[0][:200])
+
+enc = tokenizer(
+    rank_texts,
+    padding="max_length",
+    truncation=True,
+    max_length=seq_len,
+    return_tensors="pt",
 )
+
+inputs = enc["input_ids"].to(device)
+attention_mask = enc["attention_mask"].to(device)
 
 # -----------------------------
 # Run trace (1 iteration)
@@ -171,24 +230,21 @@ with profile(
 ) as prof:
 
     if args.forward_only:
-        # Forward-only (inference) mode - saves memory
+        # Forward-only (inference) mode
         with record_function("forward_only"):
             with torch.no_grad():
-                output = model(inputs)
+                output = model(inputs, attention_mask=attention_mask)
             
-            # Sync barrier for multi-GPU
             if world_size > 1:
                 dist.barrier()
     else:
         # Forward + Backward (training) mode
         with record_function("forward_backward"):
-            output = model(inputs)
-            # Get logits from the model output and compute a simple loss
+            output = model(inputs, attention_mask=attention_mask)
             logits = output.logits
-            loss = logits.sum()  # Simple loss for tracing
+            loss = logits.sum()
             loss.backward()
             
-            # Sync barrier for multi-GPU
             if world_size > 1:
                 dist.barrier()
 
@@ -202,3 +258,33 @@ print(f"Rank {rank}: Trace saved to {trace_file}")
 # Cleanup
 if world_size > 1:
     dist.destroy_process_group()
+
+# salloc --nodes 1 --qos interactive --time 01:00:00 --constraint gpu --gpus 4 --account m4999
+# hf auth login
+# export HF_HOME=/pscratch/sd/m/mh2653/.cache/huggingface
+
+# torchrun --nproc_per_node=4 trace_gen/trace_gen.py -- --workload_card trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-2GPU-pure-DP-perlmutter-inference.yaml
+
+# python tools/main.py --trace ./ --metric coll_call_num
+# python tools/main.py --trace ./ --metric straggler_delay
+# python tools/main.py --trace ./ --metric straggler_slowdown
+
+# FSDP (2GPUs)
+# coll_call_num: rank0: 99, rank1: 99
+# straggler_delay: 3.095612673844695e-07
+# straggler_slowdown: 1.0000390489546451
+
+# FSDP (4GPUs)
+# coll_call_num: rank0: 99, rank1: 99, rank2: 99, rank3: 99
+# straggler_delay: 5.303492827743813e-07
+# straggler_slowdown: 1.0007944156004465
+
+# TP (2GPUs)
+# coll_call_num: rank0: 129, rank1: 129
+# straggler_delay: 1.129688648118878e-06
+# straggler_slowdown: 1.0000241782508983
+
+# TP (4GPUs)
+# coll_call_num: rank0: 129, rank1: 129, rank2: 129, rank3: 129
+# straggler_delay: 4.903407062305596e-07
+# straggler_slowdown: 1.0002771298074606
