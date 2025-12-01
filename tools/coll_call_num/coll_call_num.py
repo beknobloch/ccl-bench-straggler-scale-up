@@ -16,7 +16,7 @@ def metric_cal(directory: str) -> int:
 
     #TODO: perform trace metadata check. For example, check if the trace is from NVIDIA GPU and uses NCCL for communication.
     communication_calls = 0
-    trace_file = os.path.join(directory, "kineto_trace_0.json")
+    trace_file = os.path.join(directory, "trace_rank_0.json")
     comm_name = ["ncclDevKernel_AllReduce", "ncclDevKernel_ReduceScatter", "ncclDevKernel_AllGather", "ncclDevKernel_Broadcast", "ncclDevKernel_Reduce", "ncclDevKernel_SendRecv"]
 
     try:

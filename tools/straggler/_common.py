@@ -19,7 +19,7 @@ _COMM_KERNEL_PREFIXES = tuple(
 
 
 def _iter_trace_files(directory: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(directory, "kineto_trace_*.json")))
+    return sorted(glob.glob(os.path.join(directory, "trace_rank_*.json")))
 
 
 def collect_comm_windows(directory: str) -> Tuple[List[str], Dict[str, Tuple[float, float]]]:
