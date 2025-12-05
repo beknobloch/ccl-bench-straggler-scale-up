@@ -49,3 +49,12 @@ Sessionx.vim
 *.json
 *.nsys-rep
 *.sqlite
+# temp traces and large junk
+trace_rank_*.json.tmp
+*.tmp
+
+
+# temp traces and large junk
+trace_rank_*.json.tmp
+*.tmp
+

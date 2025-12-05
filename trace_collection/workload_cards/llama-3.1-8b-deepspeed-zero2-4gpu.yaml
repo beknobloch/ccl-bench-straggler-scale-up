@@ -1,0 +1,59 @@
+# workload_template.yaml
+version: 1
+
+description: >
+  DeepSpeed fine-tuning for Llama 3.1 8B on 4 GPUs with ZeRO-2.
+  Profiling configured to capture straggler effects during training.
+
+hf_url: https://huggingface.co/meta-llama/Llama-3.1-8B
+trace_url: # To be uploaded to Google Drive or Canvas
+
+workload:
+  model:
+    phase: training
+    moe: false
+    granularity: model_fwd_bwd_pass
+    model_family: llama-3.1-8b
+    precision: bf16
+    epochs: 1
+    iteration: 3  # Profiled iterations
+  data:
+    batch_size: 8  # Global batch size
+    seq_len: 512
+    dataset: synthetic
+  hardware:
+    network_topo:
+      topology: nvlink
+      bandwidth_gbps:
+        - 200
+        - 900
+    xpu_spec:
+      type: GPU
+      model: nvidia_a100
+      total_count: 4
+      count_per_node: 4
+    driver_version: cuda_12.1
+
+Model-executor:
+  framework: 
+    name: deepspeed
+    compiler_tool_selection: plain_pytorch
+  model_plan_parallelization:
+    dp_replicate: 1
+    dp_shard: 4  # ZeRO-2 shards optimizer states and gradients
+    tp: 1
+    pp: 1
+    cp: 1
+  communication_library:
+    name: NCCL
+    version: 2.x
+    env:
+      NCCL_IB_QPS_PER_CONNECTION:
+  protocol_selection:
+    - p2p
+
+metric_source:
+  traces:
+    - kineto_trace
+    - torch_et
+  metrics_specific_trace:

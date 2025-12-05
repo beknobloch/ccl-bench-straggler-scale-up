@@ -21,8 +21,29 @@ def metric_cal(directory: str) -> float:
     if len(durations) <= 1:
         return 0.0
 
+    print(f"\n{'='*40}")
+    print(f"Per-Rank Communication Window Stats (Slowdown):")
+    print(f"{'Rank/PID':<40} | {'Duration (us)':<15}")
+    print(f"{'-'*40}-|-{'-'*15}")
+
+    for key, (start, end) in device_windows.items():
+        if start >= end: continue
+        rank_label = key
+        if "trace_rank_" in key:
+            try:
+                rank_part = key.split("trace_rank_")[1].split(".json")[0]
+                rank_label = f"Rank {rank_part}"
+            except:
+                pass
+        print(f"{rank_label:<40} | {end-start:<15.2f}")
+
     min_duration = min(durations)
     max_duration = max(durations)
+
+    print(f"{'='*40}\n")
+    print(f"Min Duration: {min_duration:.2f}")
+    print(f"Max Duration: {max_duration:.2f}")
+    print(f"Slowdown (Max / Min): {max_duration / min_duration:.2f}")
 
     if min_duration <= 0:
         return 0.0

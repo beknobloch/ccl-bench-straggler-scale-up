@@ -26,6 +26,29 @@ def metric_cal(directory: str) -> float:
     fastest_end = min(window[1] for window in valid_windows)
     total_window = slowest_end - global_start
 
+    print(f"\n{'='*40}")
+    print(f"Per-Rank Communication Window Stats (Delay):")
+    print(f"{'Rank/PID':<40} | {'Start (us)':<15} | {'End (us)':<15} | {'Duration (us)':<15}")
+    print(f"{'-'*40}-|-{'-'*15}-|-{'-'*15}-|-{'-'*15}")
+    
+    for key, (start, end) in device_windows.items():
+        if start >= end: continue
+        rank_label = key
+        if "trace_rank_" in key:
+            try:
+                rank_part = key.split("trace_rank_")[1].split(".json")[0]
+                rank_label = f"Rank {rank_part}"
+            except:
+                pass
+        print(f"{rank_label:<40} | {start:<15.2f} | {end:<15.2f} | {end-start:<15.2f}")
+    
+    print(f"{'='*40}\n")
+    print(f"Global Start: {global_start:.2f}")
+    print(f"Slowest End:  {slowest_end:.2f}")
+    print(f"Fastest End:  {fastest_end:.2f}")
+    print(f"Total Window: {total_window:.2f}")
+    print(f"Delay (Slowest - Fastest): {slowest_end - fastest_end:.2f}")
+
     if total_window <= 0:
         return 0.0
 

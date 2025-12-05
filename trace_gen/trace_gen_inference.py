@@ -365,24 +365,13 @@ with profile(
         inputs = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
 
-        if args.forward_only:
-            # Forward-only (inference) mode
-            with record_function(f"forward_only_batch_{batch_idx}"):
-                with torch.no_grad():
-                    output = model(inputs, attention_mask=attention_mask)
-                
-                if world_size > 1:
-                    dist.barrier()
-        else:
-            # Forward + Backward (training) mode
-            with record_function(f"forward_backward_batch_{batch_idx}"):
+        # Inference mode (forward only)
+        with record_function(f"inference_batch_{batch_idx}"):
+            with torch.no_grad():
                 output = model(inputs, attention_mask=attention_mask)
-                logits = output.logits
-                loss = logits.sum()
-                loss.backward()
-                
-                if world_size > 1:
-                    dist.barrier()
+            
+            if world_size > 1:
+                dist.barrier()
 
 # -----------------------------
 # Save trace

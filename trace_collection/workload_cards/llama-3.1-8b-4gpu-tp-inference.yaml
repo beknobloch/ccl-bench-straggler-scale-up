@@ -1,12 +1,11 @@
-# Workload card for LLaMA 3.1 8B straggler analysis test with 2 GPUs
+# Workload card for LLaMA 3.1 8B straggler analysis test
 version: 1
 
 description: >
   Simple distributed training test for straggler analysis using LLaMA 3.1 8B-like architecture.
-  Testing Data Parallelism (FSDP) on Perlmutter with 2 GPUs to measure straggler effects.
-  Using Fully Sharded Data Parallel to fit the model in memory.
+  Testing Tensor Parallelism (TP) on Perlmutter with 4 GPUs to measure straggler effects.
 
-hf_url: https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+hf_url: https://huggingface.co/meta-llama/Llama-3.1-8B
 trace_url: # Will be uploaded to Canvas
 
 workload:
@@ -15,10 +14,10 @@ workload:
     moe: false
     granularity: model_fwd_bwd_pass
     model_family: llama-3.1-8b
-    precision: fp32  # Using FP32 for testing (can change to bf16) TODO: change
-    iteration: 10  # 10 iterations (5 warmup + 1 profiled + 4 cooldown) TODO: not needed?
+    precision: fp32  # Using FP32 for testing (can change to bf16)
+    iteration: 10  # 10 iterations (5 warmup + 1 profiled + 4 cooldown)
   data:
-    batch_size: 2 
+    batch_size: 1
     seq_len: 512
     dataset: synthetic
   hardware:
@@ -29,22 +28,22 @@ workload:
     xpu_spec:
       type: GPU
       model: nvidia_a100
-      total_count: 2 
-      count_per_node: 2
+      total_count: 4
+      count_per_node: 4
     driver_version: cuda_11.8
   
 Model-executor:
   framework: 
-    name: pytorch
+    name: pytorch-inference
     compiler_tool_selection: plain_pytorch
   model_plan_parallelization:
-    dp_replicate: 1 # Using FSDP for data parallelism
-    dp_shard: 2 # FSDP sharding across 2 GPUs
-    tp: 1 # No tensor parallelism
-    pp: 1 # No pipeline parallelism
-    cp: 1 # No context parallelism
+    dp_replicate: 1
+    dp_shard: 1
+    tp: 4 # Tensor parallelism across 4 GPUs
+    pp: 1
+    cp: 1
   communication_library:
-    name: NCCL
+    name: NCCL-inference
     env:
       NCCL_IB_QPS_PER_CONNECTION: 4
       NCCL_DEBUG: INFO

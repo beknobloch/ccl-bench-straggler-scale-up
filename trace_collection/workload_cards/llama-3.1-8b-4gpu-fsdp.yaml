@@ -1,0 +1,57 @@
+# Workload card for LLaMA 3.1 8B straggler analysis test
+version: 1
+
+description: >
+  Simple distributed training test for straggler analysis using LLaMA 3.1 8B-like architecture.
+  Testing FSDP on Perlmutter with 4 GPUs to measure straggler effects.
+
+hf_url: https://huggingface.co/meta-llama/Llama-3.1-8B
+trace_url: # Will be uploaded to Canvas
+
+workload:
+  model:
+    phase: training
+    moe: false
+    granularity: model_fwd_bwd_pass
+    model_family: llama-3.1-8b
+    precision: fp32  # Using FP32 for testing (can change to bf16)
+    iteration: 10  # 10 iterations (5 warmup + 1 profiled + 4 cooldown)
+  data:
+    batch_size: 1
+    seq_len: 512
+    dataset: synthetic
+  hardware:
+    network_topo:
+      topology: nvlink
+      bandwidth_gbps:
+        - 600
+    xpu_spec:
+      type: GPU
+      model: nvidia_a100
+      total_count: 4
+      count_per_node: 4
+    driver_version: cuda_11.8
+  
+Model-executor:
+  framework: 
+    name: pytorch
+    compiler_tool_selection: plain_pytorch
+  model_plan_parallelization:
+    dp_replicate: 1 # No pure DP replication
+    dp_shard: 4 # FSDP across 4 GPUs
+    tp: 1 # No tensor parallelism
+    pp: 1 # No pipeline parallelism
+    cp: 1 # No context parallelism
+  communication_library:
+    name: NCCL
+    env:
+      NCCL_IB_QPS_PER_CONNECTION: 4
+      NCCL_DEBUG: INFO
+  protocol_selection:
+    - nvlink
+
+metric_source:
+  traces:
+    - nsys
+    - kineto_trace
+    - torch_et

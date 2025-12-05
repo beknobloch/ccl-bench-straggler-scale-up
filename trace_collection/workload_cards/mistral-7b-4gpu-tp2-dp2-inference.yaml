@@ -1,25 +1,25 @@
-# Workload card for LLaMA 3.1 8B - 2 GPU Tensor Parallelism
+# Workload card for Mistral 7B straggler analysis test
 version: 1
 
 description: >
-  LLaMA 3.1 8B training with Tensor Parallelism across 2 GPUs using TorchTitan.
-  Testing straggler effects with tensor parallel communication patterns.
+  Simple distributed training test for straggler analysis using Mistral 7B.
+  Testing Hybrid TP+DP on Perlmutter with 4 GPUs.
 
-hf_url: https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
-trace_url: # Will be uploaded
+hf_url: /pscratch/sd/k/kg597/llms/mistral-7b-instruct-v0.2
+trace_url: # Will be uploaded to Canvas
 
 workload:
   model:
     phase: training
     moe: false
     granularity: model_fwd_bwd_pass
-    model_family: llama-3.1-8b
-    precision: bf16
+    model_family: mistral-7b
+    precision: fp32
     iteration: 10
   data:
-    batch_size: 2 
+    batch_size: 1
     seq_len: 512
-    dataset: c4
+    dataset: synthetic
   hardware:
     network_topo:
       topology: nvlink
@@ -28,22 +28,22 @@ workload:
     xpu_spec:
       type: GPU
       model: nvidia_a100
-      total_count: 2 
-      count_per_node: 2
+      total_count: 4
+      count_per_node: 4
     driver_version: cuda_11.8
   
 Model-executor:
   framework: 
-    name: torchtitan
+    name: pytorch-inference
     compiler_tool_selection: plain_pytorch
   model_plan_parallelization:
-    dp_replicate: 1
+    dp_replicate: 2
     dp_shard: 1
-    tp: 2  # Tensor parallelism across 2 GPUs
+    tp: 2
     pp: 1
     cp: 1
   communication_library:
-    name: NCCL
+    name: NCCL-inference
     env:
       NCCL_IB_QPS_PER_CONNECTION: 4
       NCCL_DEBUG: INFO
@@ -52,5 +52,6 @@ Model-executor:
 
 metric_source:
   traces:
+    - nsys
     - kineto_trace
     - torch_et

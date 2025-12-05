@@ -9,11 +9,14 @@ Usage:
 """
 
 import os
+import argparse
 import yaml
+import functools
+import gzip
+import json
 import torch
 import torch.distributed as dist
 from torch.profiler import ExecutionTraceObserver, profile
-from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -59,12 +62,17 @@ def load_workload_config(yaml_path):
     with open(yaml_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    hf_url = config.get('hf_url', '')
-    if hf_url:
-        # Convert URL format to HuggingFace model ID (e.g., meta-llama/Llama-3.1-8B-Instruct)
-        model_path = '/'.join(hf_url.split('/')[-2:])
+    # Check environment variable first
+    env_model_path = os.environ.get('model_path')
+    if env_model_path:
+        model_path = env_model_path
     else:
-        model_path = None
+        hf_url = config.get('hf_url', '')
+        if hf_url:
+            # Convert URL format to HuggingFace model ID (e.g., meta-llama/Llama-3.1-8B-Instruct)
+            model_path = '/'.join(hf_url.split('/')[-2:])
+        else:
+            model_path = None
     
     # Store entire config plus extracted model_path
     config['model_path'] = model_path
@@ -79,9 +87,54 @@ def trace_handler(prof):
     print(f"Rank {rank}: Saved kineto trace to {trace_file}")
 
 
+def get_c4_data_iterator(file_path, tokenizer, batch_size, seq_length, rank, world_size, device):
+    """Iterate over C4 dataset and yield batches of tokens."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"C4 dataset not found at: {file_path}")
+        
+    print(f"Rank {rank}: Loading C4 data from {file_path}")
+    
+    while True:
+        with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+            buffer_tokens = []
+            for i, line in enumerate(f):
+                # Simple sharding based on line number
+                if i % world_size != rank:
+                    continue
+                
+                try:
+                    data = json.loads(line)
+                    text = data.get('text', '')
+                    if not text:
+                        continue
+                        
+                    # Encode text
+                    tokens = tokenizer.encode(text, add_special_tokens=True)
+                    buffer_tokens.extend(tokens)
+                    
+                    # Yield batches when we have enough tokens
+                    while len(buffer_tokens) >= batch_size * seq_length:
+                        batch_flat = buffer_tokens[:batch_size * seq_length]
+                        buffer_tokens = buffer_tokens[batch_size * seq_length:]
+                        
+                        yield torch.tensor(batch_flat, dtype=torch.long, device=device).view(batch_size, seq_length)
+                        
+                except Exception as e:
+                    print(f"Rank {rank}: Error processing line: {e}")
+                    continue
+
+
 def main():
-    # Hardcoded workload card path
-    workload_card_path = "../trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-1GPU-DP-perlmutter.yaml"
+    parser = argparse.ArgumentParser(description="Trace generation script for LLaMA 3.1 8B model")
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        default="../trace_collection/llama-3.1-8b-1GPU-DP-perlmutter/llama-3.1-8b-1GPU-DP-perlmutter.yaml",
+        help="Path to the workload card YAML file"
+    )
+    args = parser.parse_args()
+    
+    workload_card_path = args.config
     
     # Setup distributed first to get rank
     rank, world_size, local_rank = setup_distributed()
@@ -121,14 +174,35 @@ def main():
     # Load LLaMA model
     model, tokenizer = load_llama_model(model_path, device)
     
-    # Wrap with DDP for multi-GPU
+    # Enable gradient checkpointing to save memory
+    model.gradient_checkpointing_enable()
+    
+    # Wrap with FSDP for multi-GPU to save memory
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank])
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        
+        # Simple auto-wrap policy
+        my_auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1000000
+        )
+        
+        model = FSDP(
+            model,
+            auto_wrap_policy=my_auto_wrap_policy,
+            device_id=torch.cuda.current_device()
+        )
     
     # Setup ExecutionTraceObserver
     et_file = f"torch_et_{rank}.json"
     et = ExecutionTraceObserver()
     et.register_callback(et_file)
+    
+    # Setup C4 data loader
+    c4_file_path = "/pscratch/sd/k/kg597/c4_dataset/en/c4-train.00000-of-01024.json.gz"
+    data_iterator = get_c4_data_iterator(
+        c4_file_path, tokenizer, batch_size, seq_length, rank, world_size, device
+    )
     
     if rank == 0:
         print(f"\nStarting training with profiling...")
@@ -155,13 +229,8 @@ def main():
                 if rank == 0:
                     print(f"Started execution trace at iteration {iteration}")
             
-            # Generate dummy text input
-            input_ids = torch.randint(
-                low=1, 
-                high=min(32000, tokenizer.vocab_size),
-                size=(batch_size, seq_length),
-                device=device
-            )
+            # Get batch from C4 dataset
+            input_ids = next(data_iterator)
             
             # Forward pass (using labels triggers loss computation)
             outputs = model(
