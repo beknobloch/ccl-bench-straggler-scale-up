@@ -20,6 +20,9 @@ if __name__ == "__main__":
     elif metric_name == "straggler_delay":
         from straggler.straggler_delay import metric_cal
         metric_cal_func = metric_cal
+    elif metric_name == "straggler_slowdown":
+        from straggler.straggler_slowdown import metric_cal
+        metric_cal_func = metric_cal
     else:
         raise ValueError(f"Unsupported metric name: {metric_name}")
     
